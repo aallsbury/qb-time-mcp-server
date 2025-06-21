@@ -1,4 +1,5 @@
 # QuickBooks Time MCP Server (V2 Update)
+[![smithery badge](https://smithery.ai/badge/qb-time-mcp-server)](https://smithery.ai/server/qb-time-mcp-server)
 
 This is a combined MCP server that provides access to all QuickBooks Time API functionality through a single interface. It combines the functionality of four separate servers:
 
@@ -10,6 +11,14 @@ This is a combined MCP server that provides access to all QuickBooks Time API fu
 I would LOVE help improving this project! Just glad to be able to give something back finally!
 
 This entire project was developed and published using artificial intelligence (Anthropic, OpenAI, Llama/META), as I personally cannot write much code without assistance. While every effort has been made to ensure quality and functionality, there may be imperfections or areas for improvement. I welcome any feedback, corrections, or suggestions from the community.
+
+### Installing via Smithery
+
+To install QuickBooks Time MCP Server for Claude Desktop automatically via [Smithery](https://smithery.ai/server/qb-time-mcp-server):
+
+```bash
+npx -y @smithery/cli install qb-time-mcp-server --client claude
+```
 
 1. Install dependencies:
 ```bash

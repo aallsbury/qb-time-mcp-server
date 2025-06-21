@@ -1,0 +1,21 @@
+# Smithery configuration file: https://smithery.ai/docs/config#smitheryyaml
+
+startCommand:
+  type: stdio
+  configSchema:
+    # JSON Schema defining the configuration options for the MCP.
+    type: object
+    required:
+      - qbTimeAccessToken
+    properties:
+      qbTimeAccessToken:
+        type: string
+        description: The access token for the QuickBooks Time MCP server.
+      nodeEnv:
+        type: string
+        default: development
+        description: The environment setting for the server. Defaults to 'development'.
+  commandFunction:
+    # A function that produces the CLI command to start the MCP on stdio.
+    |-
+    config => ({command: 'python', args: ['main.py'], env: {QB_TIME_ACCESS_TOKEN: config.qbTimeAccessToken, NODE_ENV: config.nodeEnv || 'development'}})
