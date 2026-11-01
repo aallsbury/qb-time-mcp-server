@@ -391,22 +391,33 @@ SERVER_INFO = {
                 "properties": {
                     "user_ids": {
                         "type": "array",
-                        "items": {"type": "number"},
-                        "description": "Filter totals to specific users"
+                        "items": {"type": "integer"},
+                        "description": "Optional array of integers. Filter totals to specific users"
                     },
                     "group_ids": {
                         "type": "array",
-                        "items": {"type": "number"},
-                        "description": "Filter totals for users in specific groups"
+                        "items": {"type": "integer"},
+                        "description": "Optional array of integers. Filter totals for users in specific groups"
                     },
-                    "jobcode_ids": {
-                        "type": "array",
-                        "items": {"type": "number"},
-                        "description": "Filter totals for specific jobcodes"
-                    },
-                    "customfield_query": {
+                    "on_the_clock": {
                         "type": "string",
-                        "description": "Filter by custom field values. Format: <customfield_id>|<op>|<value>"
+                        "description": "Optional string. Filters users based on clock status (e.g., 'yes', 'no', 'both')."
+                    },
+                    "page": {
+                        "type": "integer",
+                        "description": "Optional integer. Page number for pagination."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional integer. Number of results per page for pagination, with a default and max."
+                    },
+                    "order_by": {
+                        "type": "string",
+                        "description": "Optional string. Orders results by specified field (e.g., 'username', 'first_name', etc.)."
+                    },
+                    "order_desc": {
+                        "type": "boolean",
+                        "description": "Optional boolean. Orders results descending when true."
                     }
                 }
             }
@@ -536,6 +547,19 @@ class JSONRPCServer:
             }
         })
 
+    def handle_ping(self, message: dict):
+        """Handle ping requests from LibreChat for health checking"""
+        if 'id' not in message:
+            self.send_error_response(self.get_next_id(), -32600, 'Ping request must include an id')
+            return
+
+        log_info('Received ping request - responding with MCP-compliant empty result')
+        self.send_response({
+            'jsonrpc': JSONRPC_VERSION,
+            'id': message['id'],
+            'result': {}
+        })
+
     def handle_tools_list(self, message: dict):
         if 'id' not in message:
             self.send_error_response(self.get_next_id(), -32600, 'Tools list request must include an id')
@@ -621,6 +645,8 @@ class JSONRPCServer:
 
             if message['method'] == 'initialize':
                 self.handle_initialize(message)
+            elif message['method'] == 'ping':
+                self.handle_ping(message)
             elif message['method'] == 'tools/list':
                 self.handle_tools_list(message)
             elif message['method'] == 'tools/call':

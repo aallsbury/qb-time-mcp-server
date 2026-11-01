@@ -64,7 +64,11 @@ class BaseAPI:
             if error.response is not None:
                 # The request was made and the server responded with a status code
                 # that falls out of the range of 2xx
-                error_message = error.response.json().get('error', {}).get('message') or error.response.reason
+                error_message = ""
+                try:
+                    error_message = error.response.json().get('error', {}).get('message') or error.response.reason
+                except requests.exceptions.JSONDecodeError:
+                    error_message = error.response.reason
                 log_error(f"{operation} failed: {error.response.status_code} - {error_message}")
                 raise ValueError(f"{operation} failed: {error.response.status_code} - {error_message}")
             elif error.request is not None:
@@ -79,14 +83,29 @@ class BaseAPI:
             log_error(f"{operation} failed: {str(error)}")
             raise ValueError(f"{operation} failed: {str(error)}")
 
-    def make_request(self, endpoint: str, params: Optional[Dict[str, Any]] = None):
-        """Make a request to the QuickBooks Time API."""
+    def make_request(self, endpoint: str, method: str = 'GET', params: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None):
+        """Make a request to the QuickBooks Time API.
+        
+        Args:
+            endpoint: API endpoint to call
+            method: HTTP method ('GET' or 'POST')
+            params: Query parameters for GET requests
+            data: JSON data for POST requests
+        """
         try:
-            response = requests.get(f'{self.base_url}/{endpoint}', headers=self.headers, params=params)
+            url = f'{self.base_url}/{endpoint}'
+            
+            if method.upper() == 'GET':
+                response = requests.get(url, headers=self.headers, params=params)
+            elif method.upper() == 'POST':
+                response = requests.post(url, headers=self.headers, json=data)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+                
             response.raise_for_status()
             return response.json()
         except Exception as error:
-            return self.handle_axios_error(error, f'API request to {endpoint}')
+            return self.handle_axios_error(error, f'{method} request to {endpoint}')
 
 class JobcodeAPI(BaseAPI):
     def get_jobcodes(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -383,7 +402,20 @@ class JobcodeAPI(BaseAPI):
 
     def get_current_timesheets(self, params: Optional[Dict[str, Any]] = None):
         """Get currently active timesheets."""
-        return self.make_request('timesheets/current')
+        # Get today's date in YYYY-MM-DD format for the required start_date filter
+        from datetime import datetime
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        # Initialize with required parameters
+        clean_params = {
+            'on_the_clock': 'yes',
+            'start_date': today
+        }
+        
+        if params:
+            clean_params.update(params)
+            
+        return self.make_request('timesheets', params=clean_params)
 
 class TimesheetAPI(BaseAPI):
     """API class for managing timesheets in QuickBooks Time."""
@@ -416,7 +448,7 @@ class TimesheetAPI(BaseAPI):
                 - payroll_ids: List of payroll IDs
                 - on_the_clock: Filter by working status ('yes', 'no', 'both')
                 - jobcode_type: Filter by type ('regular', 'pto', 'paid_break', 
-                               'unpaid_break', 'all')
+                                'unpaid_break', 'all')
                 
                 Pagination:
                 - page: Page number (default: 1)
@@ -588,21 +620,34 @@ class TimesheetAPI(BaseAPI):
                 - group_ids: List of group IDs to filter users
                 - jobcode_ids: List of jobcode IDs to filter timesheets
                 - supplemental_data: Include supplemental data ('yes' or 'no', default 'yes')
+                - start_date: Optional start date to override the default (today)
         
         Returns:
             API response containing current timesheets and optional supplemental data
         """
-        clean_params = {}
+        # Get today's date in YYYY-MM-DD format for the required start_date filter
+        from datetime import datetime
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        # Initialize with required parameters
+        clean_params = {
+            'on_the_clock': 'yes',
+            'start_date': today
+        }
         
         if params:
+            # Override start_date if provided
+            if 'start_date' in params:
+                clean_params['start_date'] = params['start_date']
+                
             # Handle array parameters
             array_params = ['user_ids', 'group_ids', 'jobcode_ids']
-            for param in array_params:
-                if param in params:
-                    if isinstance(params[param], list):
-                        clean_params[param] = ','.join(map(str, params[param]))
+            for param_name in array_params: # Corrected variable name here
+                if param_name in params:
+                    if isinstance(params[param_name], list):
+                        clean_params[param_name] = ','.join(map(str, params[param_name]))
                     else:
-                        clean_params[param] = str(params[param])
+                        clean_params[param_name] = str(params[param_name])
             
             # Handle supplemental_data parameter
             if 'supplemental_data' in params:
@@ -610,7 +655,7 @@ class TimesheetAPI(BaseAPI):
                     raise ValueError("supplemental_data must be one of: yes, no")
                 clean_params['supplemental_data'] = params['supplemental_data']
         
-        return self.make_request('current_timesheets', params=clean_params)
+        return self.make_request('timesheets', params=clean_params)
 
 class UserAPI(BaseAPI):
     def get_users(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1334,35 +1379,77 @@ class ReportsAPI(BaseAPI):
 
     def get_current_totals(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Get real-time totals for currently active time entries.
-        
+
+        This report provides a snapshot of current totals (shift and day) 
+        for users, particularly those currently on the clock. The request
+        is made via POST with parameters in a 'data' object in the JSON body.
+
         Args:
             params: Dictionary containing any of the following optional filters:
-                - user_ids: List of user IDs to filter totals
-                - group_ids: List of group IDs to filter users
-                - jobcode_ids: List of jobcode IDs to filter totals
-                - customfield_query: Filter by custom field values (format: <customfield_id>|<op>|<value>)
-        
+                - user_ids (Union[List[int], str, int]): A list of user IDs, a 
+                  comma-separated string of user IDs, or a single user ID.
+                  Only totals for these users will be included.
+                - group_ids (Union[List[int], str, int]): A list of group IDs, a
+                  comma-separated string of group IDs, or a single group ID.
+                  Only totals for users from these groups will be included.
+                - on_the_clock (str): 'yes', 'no', or 'both'. 
+                  If a user is `on_the_clock`, it means the user is currently 
+                  working. The API defaults to 'no' if not provided by the client,
+                  but this implementation doesn't set a default if not in params.
+                - page (int): Represents the page of results to retrieve. Default is 1.
+                - limit (int): Represents how many results to retrieve per request. 
+                  Default is 200. Max is 200. Must be > 0 and <= 200.
+                - order_by (str): Attribute name by which to order the result data, 
+                  one of: 'username', 'first_name', 'last_name', 'group_name', 
+                  'group_id', 'shift_seconds', or 'day_seconds'.
+                - order_desc (bool): If True, result data will be ordered descending 
+                  by the attribute specified in `order_by`.
+
         Returns:
-            API response containing current totals with supplemental data
+            Dict: API response containing current totals report.
+        
+        Raises:
+            ValueError: If `on_the_clock` or `limit` parameters are invalid.
         """
-        clean_params = {}
+        data_payload = {}
         
         if params:
-            # Convert array parameters to comma-separated strings
-            array_params = ['user_ids', 'group_ids', 'jobcode_ids']
-            for param in array_params:
-                if param in params and isinstance(params[param], list):
-                    clean_params[param] = ','.join(map(str, params[param]))
+            # Handle user_ids: convert list to comma-separated string
+            if 'user_ids' in params and params['user_ids'] is not None:
+                if isinstance(params['user_ids'], list):
+                    data_payload['user_ids'] = ','.join(map(str, params['user_ids']))
+                else: # Assume it's already a string or a single int that can be stringified
+                    data_payload['user_ids'] = str(params['user_ids'])
             
-            # Handle customfield_query parameter
-            if 'customfield_query' in params:
-                # Validate customfield_query format
-                query = str(params['customfield_query'])
-                if '|' not in query or len(query.split('|')) != 3:
-                    raise ValueError("customfield_query must be in format: <customfield_id>|<op>|<value>")
-                clean_params['customfield_query'] = query
+            # Handle group_ids: convert list to comma-separated string
+            if 'group_ids' in params and params['group_ids'] is not None:
+                if isinstance(params['group_ids'], list):
+                    data_payload['group_ids'] = ','.join(map(str, params['group_ids']))
+                else: # Assume it's already a string or a single int that can be stringified
+                    data_payload['group_ids'] = str(params['group_ids'])
+
+            # Handle other documented parameters directly
+            allowed_params = ['on_the_clock', 'page', 'limit', 'order_by', 'order_desc']
+            for param_name in allowed_params:
+                if param_name in params and params[param_name] is not None:
+                    data_payload[param_name] = params[param_name]
+            
+            # Validate 'on_the_clock' if it's in the payload (i.e., was provided in params)
+            if 'on_the_clock' in data_payload and data_payload['on_the_clock'] not in ['yes', 'no', 'both']:
+                raise ValueError("on_the_clock must be one of: 'yes', 'no', or 'both'")
+
+            # Validate 'limit' if it's in the payload
+            if 'limit' in data_payload:
+                limit_val = data_payload['limit']
+                if not (isinstance(limit_val, int) and 0 < limit_val <= 200):
+                    raise ValueError("limit must be an integer greater than zero and not greater than 200.")
         
-        return self.make_request('current_totals', params=clean_params)
+        # The API expects the filters object under a 'data' key in the POST body
+        # If data_payload is empty, we still send {'data': {}} as per typical API behavior for POST with optional filters
+        post_body = {'data': data_payload}
+        
+        # Call the make_request method specific to ReportsAPI which handles POST
+        return self.make_request(endpoint='reports/current_totals', method='POST', data=post_body)
 
     def get_payroll(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Get payroll data with detailed time entries grouped by user and pay period.
@@ -1439,7 +1526,7 @@ class ReportsAPI(BaseAPI):
         if 'include_zero_time' in params:
             clean_params['include_zero_time'] = str(bool(params['include_zero_time'])).lower()
         
-        return self.make_request('payroll', params=clean_params)
+        return self.make_request('payroll', params=clean_params) # Should be self.make_request from BaseAPI for GET
 
     def get_payroll_by_jobcode(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Get payroll data grouped by jobcode with detailed time entries.
@@ -1520,7 +1607,7 @@ class ReportsAPI(BaseAPI):
         if 'include_zero_time' in params:
             clean_params['include_zero_time'] = str(bool(params['include_zero_time'])).lower()
         
-        return self.make_request('payroll_by_jobcode', params=clean_params)
+        return self.make_request('payroll_by_jobcode', params=clean_params) # Should be self.make_request from BaseAPI for GET
 
     def get_project_report(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Get detailed project report with time tracking data.
@@ -1541,62 +1628,62 @@ class ReportsAPI(BaseAPI):
             API response containing the project report data
         """
         # Create a copy of params to avoid modifying the original
-        data = params.copy()
+        data_payload = params.copy() # Renamed to data_payload for clarity
         
-        # Convert array parameters to proper format
-        array_fields = ['user_ids', 'group_ids', 'jobcode_ids']
-        for field in array_fields:
-            if field in data and isinstance(data[field], list):
-                # The API expects arrays as is, no need to convert to comma-separated strings
-                continue
-                
-        # Handle custom fields
-        if 'customfielditems' in data:
-            # Ensure it's a dictionary with array values
-            if not isinstance(data['customfielditems'], dict):
+        # Convert array parameters to proper format for the API if they are lists
+        # The API for project report might expect lists directly for these fields in the POST body
+        # For consistency with other methods, we'll ensure they are at least stringified if not lists.
+        # However, the original code for this method seemed to imply lists are fine.
+        # Let's stick to the pattern of converting to comma-separated strings if they are lists,
+        # unless the API strictly requires lists for POST bodies for this specific endpoint.
+        # Re-evaluating: The API docs for POST usually specify if lists are passed directly or as CSV.
+        # For reports/project, it's a POST, and 'data' is the JSON body.
+        # The example shows "user_ids": [123, 456]. So lists are fine.
+        
+        # Handle custom fields: ensure values are lists
+        if 'customfielditems' in data_payload:
+            if not isinstance(data_payload['customfielditems'], dict):
                 raise ValueError("customfielditems must be a dictionary")
-            
-            # Ensure all values are arrays
-            for field_id, values in data['customfielditems'].items():
+            for field_id, values in data_payload['customfielditems'].items():
                 if not isinstance(values, list):
-                    data['customfielditems'][field_id] = [values]
+                    data_payload['customfielditems'][field_id] = [values]
         
         # Ensure dates are in YYYY-MM-DD format
         for date_field in ['start_date', 'end_date']:
-            if date_field not in data:
+            if date_field not in data_payload:
                 raise ValueError(f"Missing required field: {date_field}")
             try:
-                # Validate date format
-                datetime.strptime(data[date_field], '%Y-%m-%d')
+                datetime.strptime(data_payload[date_field], '%Y-%m-%d')
             except ValueError:
                 raise ValueError(f"Invalid date format for {date_field}. Expected YYYY-MM-DD")
         
-        # Make POST request with data in body
-        return self.make_request('reports/project', method='POST', data={'data': data})
+        # Make POST request with data_payload wrapped in a 'data' key
+        return self.make_request('reports/project', method='POST', data={'data': data_payload})
         
-    def make_request(self, endpoint: str, method: str = 'GET', params: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None):
-        """Make a request to the QuickBooks Time API.
+    # This make_request was specific to ReportsAPI and is now part of BaseAPI
+    # def make_request(self, endpoint: str, method: str = 'GET', params: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None):
+    #     """Make a request to the QuickBooks Time API.
         
-        Args:
-            endpoint: API endpoint to call
-            method: HTTP method ('GET' or 'POST')
-            params: Query parameters for GET requests
-            data: JSON data for POST requests
-        """
-        try:
-            url = f'{self.base_url}/{endpoint}'
+    #     Args:
+    #         endpoint: API endpoint to call
+    #         method: HTTP method ('GET' or 'POST')
+    #         params: Query parameters for GET requests
+    #         data: JSON data for POST requests
+    #     """
+    #     try:
+    #         url = f'{self.base_url}/{endpoint}'
             
-            if method.upper() == 'GET':
-                response = requests.get(url, headers=self.headers, params=params)
-            elif method.upper() == 'POST':
-                response = requests.post(url, headers=self.headers, json=data)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+    #         if method.upper() == 'GET':
+    #             response = requests.get(url, headers=self.headers, params=params)
+    #         elif method.upper() == 'POST':
+    #             response = requests.post(url, headers=self.headers, json=data)
+    #         else:
+    #             raise ValueError(f"Unsupported HTTP method: {method}")
                 
-            response.raise_for_status()
-            return response.json()
-        except Exception as error:
-            return self.handle_axios_error(error, f'{method} request to {endpoint}')
+    #         response.raise_for_status()
+    #         return response.json()
+    #     except Exception as error:
+    #         return self.handle_axios_error(error, f'{method} request to {endpoint}')
 
 class CustomFieldsAPI(BaseAPI):
     """API class for managing custom fields in QuickBooks Time."""
@@ -1642,7 +1729,12 @@ class QuickBooksTimeAPI(BaseAPI):
             return True
         except requests.exceptions.RequestException as error:
             if error.response is not None:
-                raise ValueError(f'Token validation failed: {error.response.status_code} - {error.response.reason}')
+                error_message = ""
+                try:
+                    error_message = error.response.json().get('error', {}).get('message') or error.response.reason
+                except requests.exceptions.JSONDecodeError:
+                    error_message = error.response.reason
+                raise ValueError(f'Token validation failed: {error.response.status_code} - {error_message}')
             elif error.request is not None:
                 raise ValueError('Token validation failed: No response received from server')
             else:
@@ -1651,11 +1743,14 @@ class QuickBooksTimeAPI(BaseAPI):
     def get_jobcodes(self, params: Optional[Dict[str, Any]] = None):
         return self.jobcode_api.get_jobcodes(params)
 
-    def get_jobcode(self, params: Dict[str, Any]):
-        return self.jobcode_api.get_jobcode(params.get('id'))
+    def get_jobcode(self, params: Dict[str, Any]): # Changed to accept dict
+        return self.jobcode_api.get_jobcode(params) # Pass dict directly
 
-    def search_jobcodes(self, params: Dict[str, Any]):
-        return self.jobcode_api.search_jobcodes(params)
+    # Assuming search_jobcodes was a typo and meant get_jobcodes or similar,
+    # or it's a method that needs to be defined in JobcodeAPI.
+    # For now, commenting out as it's not defined.
+    # def search_jobcodes(self, params: Dict[str, Any]):
+    #     return self.jobcode_api.search_jobcodes(params)
 
     def get_jobcode_hierarchy(self, params: Optional[Dict[str, Any]] = None):
         return self.jobcode_api.get_jobcode_hierarchy(params)
@@ -1663,8 +1758,8 @@ class QuickBooksTimeAPI(BaseAPI):
     def get_timesheets(self, params: Optional[Dict[str, Any]] = None):
         return self.timesheet_api.get_timesheets(params)
 
-    def get_timesheet(self, params: Dict[str, Any]):
-        return self.timesheet_api.get_timesheet(params.get('id'))
+    def get_timesheet(self, params: Dict[str, Any]): # Changed to accept dict
+        return self.timesheet_api.get_timesheet(params) # Pass dict directly
 
     def get_current_timesheets(self, params: Optional[Dict[str, Any]] = None):
         return self.timesheet_api.get_current_timesheets(params)
@@ -1675,13 +1770,14 @@ class QuickBooksTimeAPI(BaseAPI):
     def get_user(self, params: Dict[str, Any]):
         return self.user_api.get_user(params)
 
-    def get_current_user(self, params: Optional[Dict[str, Any]] = None):
+    def get_current_user(self, params: Optional[Dict[str, Any]] = None): # params often not used here
         return self.user_api.get_current_user()
 
     def get_groups(self, params: Optional[Dict[str, Any]] = None):
         return self.user_api.get_groups(params)
 
     def get_custom_fields(self, params: Optional[Dict[str, Any]] = None):
+        # Assuming this was meant to call the CustomFieldsAPI instance
         return self.custom_fields_api.get_custom_fields(params)
 
     def get_projects(self, params: Optional[Dict[str, Any]] = None):
@@ -1691,7 +1787,11 @@ class QuickBooksTimeAPI(BaseAPI):
         return self.project_management_api.get_project_activities(params)
 
     def get_last_modified(self, params: Optional[Dict[str, Any]] = None):
-        return self.last_modified_api.get_last_modified(params.get('types'))
+        types_list = None
+        if params and 'types' in params: # Ensure params and 'types' key exist
+            types_list = params.get('types')
+        return self.last_modified_api.get_last_modified(types_list)
+
 
     def get_notifications(self, params: Optional[Dict[str, Any]] = None):
         return self.notifications_api.get_notifications(params)
