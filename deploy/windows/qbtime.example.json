@@ -1,0 +1,17 @@
+{
+  "account": "HOSTNAME\\service-user",
+  "repoRoot": "C:\\Services\\QBTime\\release",
+  "python": "C:\\Services\\QBTime\\venv\\Scripts\\python.exe",
+  "node": "C:\\Program Files\\nodejs\\node.exe",
+  "gateway": "C:\\Services\\QBTime\\gateway\\node_modules\\supergateway\\dist\\index.js",
+  "gatewayVersion": "4.2.1",
+  "envFile": "C:\\Services\\QBTime\\private\\qbtime.env",
+  "stateDirectory": "C:\\Services\\QBTime\\state",
+  "port": 9994,
+  "startupTimeoutSeconds": 60,
+  "probeIntervalSeconds": 300,
+  "maxConsecutiveFailures": 5,
+  "cooldownSeconds": 300,
+  "stableResetSeconds": 600,
+  "restartDelaysSeconds": [5, 15, 30, 60, 120]
+}

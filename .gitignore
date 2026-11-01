@@ -1,5 +1,11 @@
 # Environment variables
 .env
+.venv/
+deploy/gateway/node_modules/
+deploy/windows/qbtime.local.json
+*.pgdump
+*.sql
+*.tgz
 
 # Python
 __pycache__/

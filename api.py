@@ -2,6 +2,7 @@ import requests
 from typing import Dict, Any, Optional, List, Union
 from utils import setup_logging, log_info, log_error
 from datetime import datetime
+from config import request_timeout
 
 class BaseAPI:
     def __init__(self, access_token: str):
@@ -11,6 +12,7 @@ class BaseAPI:
             'Authorization': f'Bearer {self.access_token}',
             'Content-Type': 'application/json'
         }
+        self.timeout = request_timeout()
 
     def format_date_params(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Format date parameters.
@@ -69,7 +71,7 @@ class BaseAPI:
                     error_message = error.response.json().get('error', {}).get('message') or error.response.reason
                 except requests.exceptions.JSONDecodeError:
                     error_message = error.response.reason
-                log_error(f"{operation} failed: {error.response.status_code} - {error_message}")
+                log_error(f"{operation} failed: status={error.response.status_code}")
                 raise ValueError(f"{operation} failed: {error.response.status_code} - {error_message}")
             elif error.request is not None:
                 # The request was made but no response was received
@@ -77,10 +79,10 @@ class BaseAPI:
                 raise ValueError(f"{operation} failed: No response received from server")
             else:
                 # Something happened in setting up the request
-                log_error(f"{operation} failed: {str(error)}")
+                log_error(f"{operation} failed: category={type(error).__name__}")
                 raise ValueError(f"{operation} failed: {str(error)}")
         else:
-            log_error(f"{operation} failed: {str(error)}")
+            log_error(f"{operation} failed: category={type(error).__name__}")
             raise ValueError(f"{operation} failed: {str(error)}")
 
     def make_request(self, endpoint: str, method: str = 'GET', params: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None):
@@ -96,14 +98,15 @@ class BaseAPI:
             url = f'{self.base_url}/{endpoint}'
             
             if method.upper() == 'GET':
-                response = requests.get(url, headers=self.headers, params=params)
+                response = requests.get(url, headers=self.headers, params=params, timeout=self.timeout)
             elif method.upper() == 'POST':
-                response = requests.post(url, headers=self.headers, json=data)
+                response = requests.post(url, headers=self.headers, json=data, timeout=self.timeout)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
                 
-            response.raise_for_status()
-            return response.json()
+            with response:
+                response.raise_for_status()
+                return response.json()
         except Exception as error:
             return self.handle_axios_error(error, f'{method} request to {endpoint}')
 
@@ -1722,9 +1725,11 @@ class QuickBooksTimeAPI(BaseAPI):
         try:
             response = requests.get(
                 f'{self.base_url}/current_user',
-                headers=self.headers
+                headers=self.headers,
+                timeout=self.timeout,
             )
-            response.raise_for_status()
+            with response:
+                response.raise_for_status()
             log_info('Token validation successful')
             return True
         except requests.exceptions.RequestException as error:

@@ -1,5 +1,8 @@
 # QuickBooks Time MCP Server (V2 Update)
 
+For reproducible dependencies, bounded API requests, compatibility tests and
+supervised Windows startup, see [the operations guide](docs/operations.md).
+
 This is a combined MCP server that provides access to all QuickBooks Time API functionality through a single interface. It combines the functionality of four separate servers:
 
 1. JobCode Tools

@@ -579,10 +579,13 @@ class JSONRPCServer:
             return
 
         params = message.get('params', {})
+        if not isinstance(params, dict):
+            self.send_error_response(message['id'], -32602, 'Invalid params: expected an object')
+            return
         name = params.get('name')
         args = params.get('arguments', {})
 
-        if not name or not isinstance(args, dict):
+        if not isinstance(name, str) or not name or not isinstance(args, dict):
             self.send_error_response(message['id'], -32602, 'Invalid params: must include name and arguments')
             return
 
@@ -626,7 +629,7 @@ class JSONRPCServer:
                 }
             })
         except Exception as e:
-            log_error(f'Error in {name}: {str(e)}')
+            log_error(f'Tool failure category={type(e).__name__}')
             self.send_error_response(message['id'], -32000, str(e))
 
     def handle_message(self, message_str: str):
@@ -634,6 +637,10 @@ class JSONRPCServer:
 
         try:
             message = json.loads(message_str)
+
+            if not isinstance(message, dict):
+                self.send_error_response(message_id, -32600, 'Invalid Request')
+                return
 
             if 'method' not in message:
                 self.send_error_response(
