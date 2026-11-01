@@ -132,6 +132,17 @@ class OwnershipTests(unittest.TestCase):
         logger = unittest.mock.Mock()
         capture_errors(io.BytesIO(b'category=ValueError status=401 synthetic-secret employee-payload\n'), logger)
         self.assertEqual(logger.error.call_args.args, ('gateway stderr category=%s status=%s', 'ValueError', '401'))
+    def test_info_and_blank_stderr_are_not_reported_as_errors(self):
+        logger = unittest.mock.Mock()
+        capture_errors(io.BytesIO(b'\r\n[supergateway] Child stderr: 2026-01-01 - INFO - synthetic-secret\n\n'), logger)
+        logger.info.assert_called_once_with('application informational message')
+        logger.error.assert_not_called()
+        logger.warning.assert_not_called()
+    def test_unclassified_stderr_is_warning_without_payload(self):
+        logger = unittest.mock.Mock()
+        capture_errors(io.BytesIO(b'unclassified synthetic-secret\n'), logger)
+        logger.warning.assert_called_once_with('unclassified gateway diagnostic; payload omitted')
+        logger.error.assert_not_called()
     def test_duplicate_supervisor_lock_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             with InstanceLock(Path(tmp) / 'lock'):

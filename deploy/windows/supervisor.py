@@ -140,11 +140,21 @@ def capture_errors(pipe, logger):
     with pipe:
         for line in iter(lambda: pipe.readline(1024), b''):
             text = line[:1024].decode('utf-8', errors='replace')
+            if not text.strip():
+                continue
+            # The gateway forwards Python logging through stderr even for INFO.
+            # Keep the severity without retaining the original message or payload.
+            if ' - INFO - ' in text:
+                logger.info('application informational message')
+                continue
             category = re.search(r'category=([A-Za-z]+)', text)
             status = re.search(r'status=([0-9]{3})', text)
-            logger.error('gateway stderr category=%s status=%s',
-                         category.group(1) if category else 'child-diagnostic',
-                         status.group(1) if status else 'unknown')
+            if category or status or ' - ERROR - ' in text or 'Traceback (' in text:
+                logger.error('gateway stderr category=%s status=%s',
+                             category.group(1) if category else 'child-diagnostic',
+                             status.group(1) if status else 'unknown')
+            else:
+                logger.warning('unclassified gateway diagnostic; payload omitted')
 
 
 def supervise(config, config_path):
