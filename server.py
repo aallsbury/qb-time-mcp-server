@@ -629,7 +629,7 @@ class JSONRPCServer:
                 }
             })
         except Exception as e:
-            log_error(f'Tool failure category={type(e).__name__}')
+            log_error(f'Tool failure stage=tool tool={name} category={type(e).__name__}')
             self.send_error_response(message['id'], -32000, str(e))
 
     def handle_message(self, message_str: str):

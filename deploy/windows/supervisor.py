@@ -133,7 +133,7 @@ def write_status(directory, **values):
     temporary.replace(directory / 'status.json')
 
 
-def capture_errors(pipe, logger):
+def capture_errors(pipe, logger, tool_names=()):
     # Info-level request/results go to DEVNULL. Retain only recognized
     # application metadata, never arbitrary provider responses or RPC payloads.
     import re
@@ -149,6 +149,15 @@ def capture_errors(pipe, logger):
                 continue
             category = re.search(r'category=([A-Za-z]+)', text)
             status = re.search(r'status=([0-9]{3})', text)
+            stage = re.search(r'\bstage=(startup|tool)\b', text)
+            tool = re.search(r'\btool=(get_[a-z_]+)\b', text)
+            if stage:
+                logger.error('gateway stage=%s tool=%s category=%s status=%s',
+                             stage.group(1), tool.group(1) if tool and tool.group(1) in tool_names else '-',
+                             category.group(1) if category and category.group(1) in
+                             ('ValueError', 'TypeError', 'TimeoutError', 'HTTPError', 'ConnectionError') else 'upstream',
+                             status.group(1) if status else '-')
+                continue
             if category or status or ' - ERROR - ' in text or 'Traceback (' in text:
                 logger.error('gateway stderr category=%s status=%s',
                              category.group(1) if category else 'child-diagnostic',
@@ -188,13 +197,14 @@ def supervise(config, config_path):
                 # The gateway starts one stdio process per session. Aggregate
                 # metadata in this process, avoiding multiprocess file rotation.
                 environment.pop('QBT_LOG_FILE', None)
+                environment['QBT_UPSTREAM_STATE'] = str(state / 'upstream.sqlite')
                 # Child waits for G on stdin until its job assignment is complete.
                 # No gateway/grandchild can escape the job during launch.
                 child = subprocess.Popen([config['python'], str(Path(__file__).resolve()), '--child', '--config', str(config_path)],
                                          cwd=config['repoRoot'], env=environment, stdin=subprocess.PIPE,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                          creationflags=subprocess.CREATE_NO_WINDOW)
-                threading.Thread(target=capture_errors, args=(child.stderr, logger), daemon=True).start()
+                threading.Thread(target=capture_errors, args=(child.stderr, logger, names), daemon=True).start()
                 job.assign(child)
                 child.stdin.write(b'G')
                 child.stdin.flush()

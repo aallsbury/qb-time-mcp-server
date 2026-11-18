@@ -3,10 +3,12 @@ from typing import Dict, Any, Optional, List, Union
 from utils import setup_logging, log_info, log_error
 from datetime import datetime
 from config import request_timeout
+from upstream import UpstreamState, retry_seconds
 
 class BaseAPI:
     def __init__(self, access_token: str):
         self.access_token = access_token
+        self.upstream = UpstreamState(access_token)
         self.base_url = 'https://rest.tsheets.com/api/v1'
         self.headers = {
             'Authorization': f'Bearer {self.access_token}',
@@ -94,6 +96,7 @@ class BaseAPI:
             params: Query parameters for GET requests
             data: JSON data for POST requests
         """
+        self.upstream.check_rate_limit()
         try:
             url = f'{self.base_url}/{endpoint}'
             
@@ -108,6 +111,8 @@ class BaseAPI:
                 response.raise_for_status()
                 return response.json()
         except Exception as error:
+            if isinstance(error, requests.HTTPError) and error.response is not None and error.response.status_code == 429:
+                self.upstream.remember('throttled', retry_seconds(error.response.headers.get('Retry-After')))
             return self.handle_axios_error(error, f'{method} request to {endpoint}')
 
 class JobcodeAPI(BaseAPI):
@@ -1719,9 +1724,11 @@ class QuickBooksTimeAPI(BaseAPI):
         self.notifications_api = NotificationsAPI(access_token)
         self.additional_features_api = AdditionalFeaturesAPI(access_token)
         self.reports_api = ReportsAPI(access_token)
-        self.validate_token()
+        if not self.upstream.remaining('validated'):
+            self.validate_token()
 
     def validate_token(self) -> bool:
+        self.upstream.check_rate_limit()
         try:
             response = requests.get(
                 f'{self.base_url}/current_user',
@@ -1731,6 +1738,7 @@ class QuickBooksTimeAPI(BaseAPI):
             with response:
                 response.raise_for_status()
             log_info('Token validation successful')
+            self.upstream.remember('validated', 90)
             return True
         except requests.exceptions.RequestException as error:
             if error.response is not None:
@@ -1739,7 +1747,11 @@ class QuickBooksTimeAPI(BaseAPI):
                     error_message = error.response.json().get('error', {}).get('message') or error.response.reason
                 except requests.exceptions.JSONDecodeError:
                     error_message = error.response.reason
-                raise ValueError(f'Token validation failed: {error.response.status_code} - {error_message}')
+                status = error.response.status_code
+                log_error(f'upstream failure stage=startup status={status}')
+                if status == 429:
+                    self.upstream.remember('throttled', retry_seconds(error.response.headers.get('Retry-After')))
+                raise ValueError(f'Token validation failed: {status} - {error_message}')
             elif error.request is not None:
                 raise ValueError('Token validation failed: No response received from server')
             else:

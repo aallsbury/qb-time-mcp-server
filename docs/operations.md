@@ -107,3 +107,16 @@ The supervisor does not roll back application source or change other MCP servers
 After activation, check `status.json` and perform a tools/list handshake from the
 consumer before resuming scheduled callers. A successful handshake proves the
 interface/token check, not the correctness of every business operation.
+### Supervised upstream requests
+
+Windows sessions share a small SQLite file in the protected state directory.
+Successful token validation is reusable for 90 seconds for that token. Every
+business request still authenticates with QuickBooks Time. When the provider
+returns HTTP 429, subsequent upstream requests for that token respect the
+numeric or HTTP-date Retry-After deadline (60 seconds by default, one day
+maximum). The server returns a rate-limit error immediately during that wait.
+The state file holds a token fingerprint, the kind of deadline, and its time.
+Direct stdio launches use the original per-session token validation by default.
+The supervisor records startup HTTP status and the name of a failing tool from
+the installed contract. Request bodies, employee records and tokens stay out of
+its diagnostics.

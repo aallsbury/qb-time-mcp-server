@@ -83,6 +83,40 @@ class ContractTests(unittest.TestCase):
 
 
 class HttpTests(unittest.TestCase):
+    def test_validation_cache_and_rate_limit_are_shared_and_scoped_to_token(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'QBT_UPSTREAM_STATE': str(Path(tmp) / 'test.db')}):
+            with patch.object(requests, 'get', return_value=FakeResponse()) as get:
+                api.QuickBooksTimeAPI('fixture-a')
+                api.QuickBooksTimeAPI('fixture-a')
+                api.QuickBooksTimeAPI('fixture-b')
+                self.assertEqual(get.call_count, 2)
+            limited = requests.Response()
+            limited.status_code = 429
+            limited.headers['Retry-After'] = '75'
+            limited._content = b'{"error":{"message":"fixture"}}'
+            limited._content_consumed = True
+            with patch.object(requests, 'get', return_value=limited) as get:
+                with self.assertRaisesRegex(ValueError, '429'):
+                    api.BaseAPI('fixture-a').make_request('timesheets')
+                with self.assertRaisesRegex(ValueError, 'Retry after'):
+                    api.BaseAPI('fixture-a').make_request('users')
+                self.assertEqual(get.call_count, 1)
+            with patch.object(requests, 'get', return_value=FakeResponse()):
+                api.BaseAPI('fixture-b').make_request('users')
+
+    def test_startup_throttle_records_safe_status_and_blocks_new_requests(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'QBT_UPSTREAM_STATE': str(Path(tmp) / 'test.db')}):
+            response = requests.Response()
+            response.status_code = 429
+            response._content = b'{"error":{"message":"sensitive fixture"}}'
+            response._content_consumed = True
+            with patch.object(requests, 'get', return_value=response) as get, patch.object(api, 'log_error') as log:
+                for _ in range(2):
+                    with self.assertRaisesRegex(ValueError, '429'):
+                        api.QuickBooksTimeAPI('fixture')
+                self.assertEqual(get.call_count, 1)
+                log.assert_called_once_with('upstream failure stage=startup status=429')
+
     def test_get_and_post_have_deadlines_and_close_responses(self):
         client = api.BaseAPI('synthetic-token')
         for method in ('GET', 'POST'):
