@@ -1,6 +1,6 @@
 import requests
 from typing import Dict, Any, Optional, List, Union
-from utils import setup_logging, log_info, log_error
+from utils import ClientSafeError, log_info, log_error
 from datetime import datetime
 from config import request_timeout
 from upstream import UpstreamState, retry_seconds
@@ -64,28 +64,40 @@ class BaseAPI:
         return clean_params
 
     def handle_axios_error(self, error: Exception, operation: str):
-        if isinstance(error, requests.exceptions.RequestException):
-            if error.response is not None:
-                # The request was made and the server responded with a status code
-                # that falls out of the range of 2xx
-                error_message = ""
-                try:
-                    error_message = error.response.json().get('error', {}).get('message') or error.response.reason
-                except requests.exceptions.JSONDecodeError:
-                    error_message = error.response.reason
-                log_error(f"{operation} failed: status={error.response.status_code}")
-                raise ValueError(f"{operation} failed: {error.response.status_code} - {error_message}")
-            elif error.request is not None:
-                # The request was made but no response was received
-                log_error(f"{operation} failed: No response received")
-                raise ValueError(f"{operation} failed: No response received from server")
-            else:
-                # Something happened in setting up the request
-                log_error(f"{operation} failed: category={type(error).__name__}")
-                raise ValueError(f"{operation} failed: {str(error)}")
+        # URLs, bodies, HTTP reason phrases and exception text can contain private data.
+        stage = 'startup' if operation == 'startup' else 'tool'
+        response = getattr(error, 'response', None)
+        if isinstance(error, requests.HTTPError) and response is not None:
+            status = response.status_code
+            if type(status) is int and 100 <= status <= 599:
+                log_error(f'upstream failure stage={stage} status={status}')
+                if status == 429:
+                    delay = retry_seconds(response.headers.get('Retry-After'))
+                    self.upstream.remember('throttled', delay)
+                    raise ClientSafeError(f'QuickBooks Time rate limited (429). Retry after {delay} seconds.') from None
+                advice = {
+                    400: 'Check the tool arguments.',
+                    401: 'Check the configured access token.',
+                    403: 'Check the configured account permissions.',
+                    404: 'Check that the requested resource exists.',
+                    417: 'Check the tool arguments.',
+                }.get(status, 'Try again later.' if status >= 500 else 'Check the request.')
+                raise ClientSafeError(f'QuickBooks Time returned HTTP {status}. {advice}') from None
+
+        if isinstance(error, requests.exceptions.Timeout):
+            message = 'QuickBooks Time request timed out. Try again later.'
+            category = 'Timeout'
+        elif isinstance(error, requests.exceptions.InvalidJSONError):
+            message = 'QuickBooks Time returned an invalid JSON response. Try again later.'
+            category = 'InvalidJSON'
+        elif isinstance(error, requests.exceptions.RequestException):
+            message = 'Could not complete the QuickBooks Time request. Check connectivity and try again.'
+            category = 'RequestError'
         else:
-            log_error(f"{operation} failed: category={type(error).__name__}")
-            raise ValueError(f"{operation} failed: {str(error)}")
+            message = 'Could not process the QuickBooks Time response. Check the service logs.'
+            category = 'UnexpectedError'
+        log_error(f'upstream failure stage={stage} category={category}')
+        raise ClientSafeError(message) from None
 
     def make_request(self, endpoint: str, method: str = 'GET', params: Optional[Dict[str, Any]] = None, data: Optional[Dict[str, Any]] = None):
         """Make a request to the QuickBooks Time API.
@@ -105,15 +117,15 @@ class BaseAPI:
             elif method.upper() == 'POST':
                 response = requests.post(url, headers=self.headers, json=data, timeout=self.timeout)
             else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+                raise ClientSafeError("Unsupported HTTP method. Use GET or POST.")
                 
             with response:
                 response.raise_for_status()
                 return response.json()
+        except ClientSafeError:
+            raise
         except Exception as error:
-            if isinstance(error, requests.HTTPError) and error.response is not None and error.response.status_code == 429:
-                self.upstream.remember('throttled', retry_seconds(error.response.headers.get('Retry-After')))
-            return self.handle_axios_error(error, f'{method} request to {endpoint}')
+            return self.handle_axios_error(error, 'tool')
 
 class JobcodeAPI(BaseAPI):
     def get_jobcodes(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -182,13 +194,13 @@ class JobcodeAPI(BaseAPI):
             if 'active' in params:
                 value = str(params['active']).lower()
                 if value not in ['yes', 'no', 'both']:
-                    raise ValueError("active must be one of: yes, no, both")
+                    raise ClientSafeError("active must be one of: yes, no, both")
                 clean_params['active'] = value
                 
             if 'type' in params:
                 value = str(params['type']).lower()
                 if value not in ['regular', 'pto', 'paid_break', 'unpaid_break', 'all']:
-                    raise ValueError("type must be one of: regular, pto, paid_break, unpaid_break, all")
+                    raise ClientSafeError("type must be one of: regular, pto, paid_break, unpaid_break, all")
                 clean_params['type'] = value
             
             # Handle boolean parameters
@@ -204,24 +216,24 @@ class JobcodeAPI(BaseAPI):
                         datetime.fromisoformat(params[param].replace('Z', '+00:00'))
                         clean_params[param] = params[param]
                     except ValueError:
-                        raise ValueError(f"{param} must be in ISO 8601 format")
+                        raise ClientSafeError(f"{param} must be in ISO 8601 format") from None
             
             # Handle pagination parameters
             if 'page' in params:
                 if not isinstance(params['page'], (int, float)) or params['page'] < 1:
-                    raise ValueError("page must be a positive number")
+                    raise ClientSafeError("page must be a positive number")
                 clean_params['page'] = int(params['page'])
                 
             if 'limit' in params:
                 if not isinstance(params['limit'], (int, float)) or params['limit'] < 1 or params['limit'] > 200:
-                    raise ValueError("limit must be a number between 1 and 200")
+                    raise ClientSafeError("limit must be a number between 1 and 200")
                 clean_params['limit'] = int(params['limit'])
         
         try:
             response = self.make_request('jobcodes', params=clean_params)
             
             if not response.get('results', {}).get('jobcodes'):
-                raise ValueError('No jobcodes found matching the specified criteria')
+                raise ClientSafeError('No jobcodes found matching the specified criteria')
                 
             return response
             
@@ -229,9 +241,9 @@ class JobcodeAPI(BaseAPI):
             # Handle specific error cases
             if error.response is not None:
                 if error.response.status_code == 403:
-                    raise ValueError('Permission denied. Please verify your access rights.')
+                    raise ClientSafeError('Permission denied. Please verify your access rights.')
                 elif error.response.status_code == 429:
-                    raise ValueError('Rate limit exceeded. Please try again later.')
+                    raise ClientSafeError('Rate limit exceeded. Please try again later.')
 
             # Handle general request errors
             return self.handle_axios_error(error, 'Fetching jobcodes')
@@ -281,7 +293,7 @@ class JobcodeAPI(BaseAPI):
             
         # Validate ID format
         if not isinstance(jobcode_id, int) or jobcode_id <= 0:
-            raise ValueError('Invalid jobcode ID. Must be a positive integer.')
+            raise ClientSafeError('Invalid jobcode ID. Must be a positive integer.')
 
         try:
             # Prepare request parameters
@@ -296,11 +308,11 @@ class JobcodeAPI(BaseAPI):
             # Extract jobcode from response
             jobcodes = response.get('results', {}).get('jobcodes', {})
             if not jobcodes:
-                raise ValueError('No jobcode data found in response')
+                raise ClientSafeError('No jobcode data found in response')
 
             jobcode = jobcodes.get(str(jobcode_id))
             if not jobcode:
-                raise ValueError(f'Jobcode {jobcode_id} not found. It may be deleted or you may not have access.')
+                raise ClientSafeError('Jobcode not found. It may be deleted or you may not have access.')
 
             return {'result': jobcode}
 
@@ -308,14 +320,14 @@ class JobcodeAPI(BaseAPI):
             # Handle specific error cases
             if error.response is not None:
                 if error.response.status_code == 403:
-                    raise ValueError(f'Permission denied for jobcode {jobcode_id}. Please verify your access rights.')
+                    raise ClientSafeError('Permission denied for the requested jobcode. Please verify your access rights.')
                 elif error.response.status_code == 429:
-                    raise ValueError('Rate limit exceeded. Please try again later.')
+                    raise ClientSafeError('Rate limit exceeded. Please try again later.')
                 elif error.response.status_code == 417:
-                    raise ValueError('Invalid jobcode ID format. Must be a positive integer.')
+                    raise ClientSafeError('Invalid jobcode ID format. Must be a positive integer.')
 
             # Handle general request errors
-            return self.handle_axios_error(error, f'Fetching jobcode {jobcode_id}')
+            return self.handle_axios_error(error, 'Fetching jobcode')
 
     def get_jobcode_hierarchy(self, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Get the hierarchical structure of jobcodes in your company.
@@ -362,27 +374,27 @@ class JobcodeAPI(BaseAPI):
                     # Convert all IDs to strings and join
                     clean_params['parent_ids'] = ','.join(map(str, params['parent_ids']))
                 else:
-                    raise ValueError("parent_ids must be a list of integers")
+                    raise ClientSafeError("parent_ids must be a list of integers")
             
             # Handle active parameter
             if 'active' in params:
                 value = str(params['active']).lower()
                 if value not in ['yes', 'no', 'both']:
-                    raise ValueError("active must be one of: yes, no, both")
+                    raise ClientSafeError("active must be one of: yes, no, both")
                 clean_params['active'] = value
             
             # Handle type parameter
             if 'type' in params:
                 value = str(params['type']).lower()
                 if value not in ['regular', 'pto', 'paid_break', 'unpaid_break', 'all']:
-                    raise ValueError("type must be one of: regular, pto, paid_break, unpaid_break, all")
+                    raise ClientSafeError("type must be one of: regular, pto, paid_break, unpaid_break, all")
                 clean_params['type'] = value
         
         try:
             response = self.make_request('jobcodes', params=clean_params)
             
             if not response.get('results', {}).get('jobcodes'):
-                raise ValueError('No jobcodes found matching the specified criteria')
+                raise ClientSafeError('No jobcodes found matching the specified criteria')
                 
             return response
             
@@ -390,9 +402,9 @@ class JobcodeAPI(BaseAPI):
             # Handle specific error cases
             if error.response is not None:
                 if error.response.status_code == 403:
-                    raise ValueError('Permission denied. Please verify your access rights.')
+                    raise ClientSafeError('Permission denied. Please verify your access rights.')
                 elif error.response.status_code == 429:
-                    raise ValueError('Rate limit exceeded. Please try again later.')
+                    raise ClientSafeError('Rate limit exceeded. Please try again later.')
 
             # Handle general request errors
             return self.handle_axios_error(error, 'Fetching jobcode hierarchy')
@@ -495,13 +507,13 @@ class TimesheetAPI(BaseAPI):
             ValueError: If no required filter is provided or parameters are invalid
         """
         if not params:
-            raise ValueError("At least one required filter must be specified: ids, start_date, modified_before, or modified_since")
+            raise ClientSafeError("At least one required filter must be specified: ids, start_date, modified_before, or modified_since")
         
         clean_params = {}
         required_filters = {'ids', 'start_date', 'modified_before', 'modified_since'}
         
         if not any(filter_name in params for filter_name in required_filters):
-            raise ValueError("At least one required filter must be specified: ids, start_date, modified_before, or modified_since")
+            raise ClientSafeError("At least one required filter must be specified: ids, start_date, modified_before, or modified_since")
         
         # Handle array parameters
         array_params = ['ids', 'user_ids', 'group_ids', 'jobcode_ids', 'payroll_ids']
@@ -521,7 +533,7 @@ class TimesheetAPI(BaseAPI):
                     datetime.strptime(params[param], '%Y-%m-%d')
                     clean_params[param] = params[param]
                 except ValueError:
-                    raise ValueError(f"{param} must be in YYYY-MM-DD format")
+                    raise ClientSafeError(f"{param} must be in YYYY-MM-DD format") from None
         
         # Handle ISO 8601 timestamp parameters
         timestamp_params = ['modified_before', 'modified_since']
@@ -532,18 +544,18 @@ class TimesheetAPI(BaseAPI):
                     datetime.fromisoformat(params[param].replace('Z', '+00:00'))
                     clean_params[param] = params[param]
                 except ValueError:
-                    raise ValueError(f"{param} must be in ISO 8601 format")
+                    raise ClientSafeError(f"{param} must be in ISO 8601 format") from None
         
         # Handle on_the_clock parameter
         if 'on_the_clock' in params:
             if params['on_the_clock'] not in self.VALID_ON_THE_CLOCK:
-                raise ValueError("on_the_clock must be one of: yes, no, both")
+                raise ClientSafeError("on_the_clock must be one of: yes, no, both")
             clean_params['on_the_clock'] = params['on_the_clock']
         
         # Handle jobcode_type parameter
         if 'jobcode_type' in params:
             if params['jobcode_type'] not in self.VALID_JOBCODE_TYPES:
-                raise ValueError("jobcode_type must be one of: regular, pto, paid_break, unpaid_break, all")
+                raise ClientSafeError("jobcode_type must be one of: regular, pto, paid_break, unpaid_break, all")
             clean_params['jobcode_type'] = params['jobcode_type']
         
         # Handle pagination
@@ -601,7 +613,7 @@ class TimesheetAPI(BaseAPI):
         if isinstance(id, dict):
             timesheet_id = id.get('id')
             if timesheet_id is None:
-                raise ValueError("Dictionary parameter must contain 'id' key")
+                raise ClientSafeError("Dictionary parameter must contain 'id' key")
         elif isinstance(id, (int, str)):
             timesheet_id = str(id)
         else:
@@ -609,7 +621,7 @@ class TimesheetAPI(BaseAPI):
         
         # Validate supplemental_data parameter
         if supplemental_data not in self.VALID_SUPPLEMENTAL_DATA:
-            raise ValueError("supplemental_data must be one of: yes, no")
+            raise ClientSafeError("supplemental_data must be one of: yes, no")
         
         # Build parameters
         params = {
@@ -660,7 +672,7 @@ class TimesheetAPI(BaseAPI):
             # Handle supplemental_data parameter
             if 'supplemental_data' in params:
                 if params['supplemental_data'] not in self.VALID_SUPPLEMENTAL_DATA:
-                    raise ValueError("supplemental_data must be one of: yes, no")
+                    raise ClientSafeError("supplemental_data must be one of: yes, no")
                 clean_params['supplemental_data'] = params['supplemental_data']
         
         return self.make_request('timesheets', params=clean_params)
@@ -788,14 +800,14 @@ class UserAPI(BaseAPI):
             if 'active' in params:
                 value = str(params['active']).lower()
                 if value not in ['yes', 'no', 'both']:
-                    raise ValueError("active must be one of: yes, no, both")
+                    raise ClientSafeError("active must be one of: yes, no, both")
                 clean_params['active'] = value
             
             # Handle supplemental_data parameter
             if 'supplemental_data' in params:
                 value = str(params['supplemental_data']).lower()
                 if value not in ['yes', 'no']:
-                    raise ValueError("supplemental_data must be either 'yes' or 'no'")
+                    raise ClientSafeError("supplemental_data must be either 'yes' or 'no'")
                 clean_params['supplemental_data'] = value
         
         return self.make_request('groups', params=clean_params)
@@ -837,7 +849,7 @@ class UserAPI(BaseAPI):
                 if param in params:
                     value = str(params[param]).lower()
                     if value not in valid_values:
-                        raise ValueError(f"{param} must be one of: {', '.join(valid_values)}")
+                        raise ClientSafeError(f"{param} must be one of: {', '.join(valid_values)}")
                     clean_params[param] = value
         
         return self.make_request('customfields', params=clean_params)
@@ -936,7 +948,7 @@ class ProjectManagementAPI(BaseAPI):
             if 'active' in params:
                 status = str(params['active']).lower()
                 if status not in self.VALID_ACTIVE_STATUS:
-                    raise ValueError("active must be one of: yes, no, both")
+                    raise ClientSafeError("active must be one of: yes, no, both")
                 clean_params['active'] = status
             
             # Handle single ID parameters
@@ -954,17 +966,17 @@ class ProjectManagementAPI(BaseAPI):
                         datetime.fromisoformat(params[param].replace('Z', '+00:00'))
                         clean_params[param] = params[param]
                     except (ValueError, AttributeError):
-                        raise ValueError(f"{param} must be in ISO 8601 format")
+                        raise ClientSafeError(f"{param} must be in ISO 8601 format") from None
             
             # Handle pagination parameters
             if 'page' in params:
                 if not isinstance(params['page'], (int, float)) or params['page'] < 1:
-                    raise ValueError("page must be a positive number")
+                    raise ClientSafeError("page must be a positive number")
                 clean_params['page'] = int(params['page'])
             
             if 'per_page' in params:
                 if not isinstance(params['per_page'], (int, float)) or not (1 <= params['per_page'] <= 50):
-                    raise ValueError("per_page must be between 1 and 50")
+                    raise ClientSafeError("per_page must be between 1 and 50")
                 clean_params['per_page'] = int(params['per_page'])
         
         return self.make_request('projects', params=clean_params)
@@ -1042,7 +1054,7 @@ class ProjectManagementAPI(BaseAPI):
                     types = [types]
                 invalid_types = set(types) - self.VALID_ACTIVITY_TYPES
                 if invalid_types:
-                    raise ValueError(f"Invalid activity type(s): {invalid_types}")
+                    raise ClientSafeError(f"activity_types must contain only: {', '.join(sorted(self.VALID_ACTIVITY_TYPES))}")
                 clean_params['activity_types'] = ','.join(types)
             
             # Handle date parameters
@@ -1054,17 +1066,17 @@ class ProjectManagementAPI(BaseAPI):
                         datetime.fromisoformat(params[param].replace('Z', '+00:00'))
                         clean_params[param] = params[param]
                     except (ValueError, AttributeError):
-                        raise ValueError(f"{param} must be in ISO 8601 format")
+                        raise ClientSafeError(f"{param} must be in ISO 8601 format") from None
             
             # Handle pagination parameters
             if 'page' in params:
                 if not isinstance(params['page'], (int, float)) or params['page'] < 1:
-                    raise ValueError("page must be a positive number")
+                    raise ClientSafeError("page must be a positive number")
                 clean_params['page'] = int(params['page'])
             
             if 'per_page' in params:
                 if not isinstance(params['per_page'], (int, float)) or not (1 <= params['per_page'] <= 50):
-                    raise ValueError("per_page must be between 1 and 50")
+                    raise ClientSafeError("per_page must be between 1 and 50")
                 clean_params['per_page'] = int(params['per_page'])
         
         return self.make_request('project_activities', params=clean_params)
@@ -1120,9 +1132,8 @@ class LastModifiedAPI(BaseAPI):
             # Validate all types before making the request
             invalid_types = set(types) - self.VALID_TYPES
             if invalid_types:
-                raise ValueError(
-                    f"Invalid entity type(s): {', '.join(invalid_types)}. "
-                    f"Valid types are: {', '.join(sorted(self.VALID_TYPES))}"
+                raise ClientSafeError(
+                    f"Entity types must contain only: {', '.join(sorted(self.VALID_TYPES))}"
                 )
             
             # Convert list to comma-separated string
@@ -1132,7 +1143,7 @@ class LastModifiedAPI(BaseAPI):
             response = self.make_request('last_modified_timestamps', params=params)
             
             if not response.get('results', {}).get('last_modified_timestamps'):
-                raise ValueError('No timestamp data returned from the API')
+                raise ClientSafeError('No timestamp data returned from the API')
                 
             return response
             
@@ -1140,9 +1151,9 @@ class LastModifiedAPI(BaseAPI):
             # Handle specific error cases
             if error.response is not None:
                 if error.response.status_code == 403:
-                    raise ValueError('Permission denied. Please verify your access rights.')
+                    raise ClientSafeError('Permission denied. Please verify your access rights.')
                 elif error.response.status_code == 429:
-                    raise ValueError('Rate limit exceeded. Please try again later.')
+                    raise ClientSafeError('Rate limit exceeded. Please try again later.')
             
             # Handle general request errors
             return self.handle_axios_error(error, 'Fetching last modified timestamps')
@@ -1224,14 +1235,14 @@ class NotificationsAPI(BaseAPI):
                     types = [types]
                 invalid_types = set(types) - self.VALID_NOTIFICATION_TYPES
                 if invalid_types:
-                    raise ValueError(f"Invalid notification type(s): {invalid_types}")
+                    raise ClientSafeError(f"Notification types must contain only: {', '.join(sorted(self.VALID_NOTIFICATION_TYPES))}")
                 clean_params['notification_types'] = ','.join(types)
             
             # Handle read status
             if 'read_status' in params:
                 status = str(params['read_status']).lower()
                 if status not in self.VALID_READ_STATUS:
-                    raise ValueError("read_status must be one of: read, unread, both")
+                    raise ClientSafeError("read_status must be one of: read, unread, both")
                 clean_params['read_status'] = status
             
             # Handle date parameters
@@ -1243,17 +1254,17 @@ class NotificationsAPI(BaseAPI):
                         datetime.fromisoformat(params[param].replace('Z', '+00:00'))
                         clean_params[param] = params[param]
                     except (ValueError, AttributeError):
-                        raise ValueError(f"{param} must be in ISO 8601 format")
+                        raise ClientSafeError(f"{param} must be in ISO 8601 format") from None
             
             # Handle pagination parameters
             if 'page' in params:
                 if not isinstance(params['page'], (int, float)) or params['page'] < 1:
-                    raise ValueError("page must be a positive number")
+                    raise ClientSafeError("page must be a positive number")
                 clean_params['page'] = int(params['page'])
             
             if 'per_page' in params:
                 if not isinstance(params['per_page'], (int, float)) or not (1 <= params['per_page'] <= 50):
-                    raise ValueError("per_page must be between 1 and 50")
+                    raise ClientSafeError("per_page must be between 1 and 50")
                 clean_params['per_page'] = int(params['per_page'])
         
         return self.make_request('notifications', params=clean_params)
@@ -1330,13 +1341,13 @@ class AdditionalFeaturesAPI(BaseAPI):
                 if isinstance(params['ids'], list):
                     clean_params['ids'] = ','.join(map(str, params['ids']))
                 else:
-                    raise ValueError("ids must be a list of integers")
+                    raise ClientSafeError("ids must be a list of integers")
             
             # Handle enum parameters
             if 'active' in params:
                 value = str(params['active']).lower()
                 if value not in ['yes', 'no', 'both']:
-                    raise ValueError("active must be one of: yes, no, both")
+                    raise ClientSafeError("active must be one of: yes, no, both")
                 clean_params['active'] = value
             
             # Handle date parameters
@@ -1348,24 +1359,24 @@ class AdditionalFeaturesAPI(BaseAPI):
                         datetime.fromisoformat(params[param].replace('Z', '+00:00'))
                         clean_params[param] = params[param]
                     except (ValueError, AttributeError):
-                        raise ValueError(f"{param} must be in ISO 8601 format (YYYY-MM-DDThh:mm:ss±hh:mm)")
+                        raise ClientSafeError(f"{param} must be in ISO 8601 format (YYYY-MM-DDThh:mm:ss±hh:mm)") from None
             
             # Handle pagination parameters
             if 'page' in params:
                 if not isinstance(params['page'], (int, float)) or params['page'] < 1:
-                    raise ValueError("page must be a positive number")
+                    raise ClientSafeError("page must be a positive number")
                 clean_params['page'] = int(params['page'])
                 
             if 'per_page' in params:
                 if not isinstance(params['per_page'], (int, float)) or params['per_page'] < 1 or params['per_page'] > 50:
-                    raise ValueError("per_page must be a number between 1 and 50")
+                    raise ClientSafeError("per_page must be a number between 1 and 50")
                 clean_params['per_page'] = int(params['per_page'])
         
         try:
             response = self.make_request('managed_clients', params=clean_params)
             
             if not response.get('results', {}).get('managed_clients'):
-                raise ValueError('No managed clients found matching the specified criteria')
+                raise ClientSafeError('No managed clients found matching the specified criteria')
                 
             return response
             
@@ -1373,9 +1384,9 @@ class AdditionalFeaturesAPI(BaseAPI):
             # Handle specific error cases
             if error.response is not None:
                 if error.response.status_code == 403:
-                    raise ValueError('Permission denied. Please verify your access rights.')
+                    raise ClientSafeError('Permission denied. Please verify your access rights.')
                 elif error.response.status_code == 429:
-                    raise ValueError('Rate limit exceeded. Please try again later.')
+                    raise ClientSafeError('Rate limit exceeded. Please try again later.')
             
             # Handle general request errors
             return self.handle_axios_error(error, 'Fetching managed clients')
@@ -1444,13 +1455,13 @@ class ReportsAPI(BaseAPI):
             
             # Validate 'on_the_clock' if it's in the payload (i.e., was provided in params)
             if 'on_the_clock' in data_payload and data_payload['on_the_clock'] not in ['yes', 'no', 'both']:
-                raise ValueError("on_the_clock must be one of: 'yes', 'no', or 'both'")
+                raise ClientSafeError("on_the_clock must be one of: 'yes', 'no', or 'both'")
 
             # Validate 'limit' if it's in the payload
             if 'limit' in data_payload:
                 limit_val = data_payload['limit']
                 if not (isinstance(limit_val, int) and 0 < limit_val <= 200):
-                    raise ValueError("limit must be an integer greater than zero and not greater than 200.")
+                    raise ClientSafeError("limit must be an integer greater than zero and not greater than 200.")
         
         # The API expects the filters object under a 'data' key in the POST body
         # If data_payload is empty, we still send {'data': {}} as per typical API behavior for POST with optional filters
@@ -1505,9 +1516,9 @@ class ReportsAPI(BaseAPI):
             ValueError: If required parameters are missing or parameter validation fails
         """
         if not params.get('start_date'):
-            raise ValueError("start_date is required (format: YYYY-MM-DD)")
+            raise ClientSafeError("start_date is required (format: YYYY-MM-DD)")
         if not params.get('end_date'):
-            raise ValueError("end_date is required (format: YYYY-MM-DD)")
+            raise ClientSafeError("end_date is required (format: YYYY-MM-DD)")
             
         clean_params = {}
         
@@ -1519,7 +1530,7 @@ class ReportsAPI(BaseAPI):
             clean_params['start_date'] = params['start_date']
             clean_params['end_date'] = params['end_date']
         except ValueError:
-            raise ValueError("Dates must be in YYYY-MM-DD format")
+            raise ClientSafeError("Dates must be in YYYY-MM-DD format") from None
             
         # Handle array parameters
         array_params = ['user_ids', 'group_ids']
@@ -1579,9 +1590,9 @@ class ReportsAPI(BaseAPI):
             ValueError: If required parameters are missing or parameter validation fails
         """
         if not params.get('start_date'):
-            raise ValueError("start_date is required (format: YYYY-MM-DD)")
+            raise ClientSafeError("start_date is required (format: YYYY-MM-DD)")
         if not params.get('end_date'):
-            raise ValueError("end_date is required (format: YYYY-MM-DD)")
+            raise ClientSafeError("end_date is required (format: YYYY-MM-DD)")
             
         clean_params = {}
         
@@ -1593,7 +1604,7 @@ class ReportsAPI(BaseAPI):
             clean_params['start_date'] = params['start_date']
             clean_params['end_date'] = params['end_date']
         except ValueError:
-            raise ValueError("Dates must be in YYYY-MM-DD format")
+            raise ClientSafeError("Dates must be in YYYY-MM-DD format") from None
             
         # Handle array parameters
         array_params = ['user_ids', 'group_ids', 'jobcode_ids']
@@ -1608,7 +1619,7 @@ class ReportsAPI(BaseAPI):
         if 'jobcode_type' in params:
             jobcode_type = str(params['jobcode_type']).lower()
             if jobcode_type not in ['regular', 'pto', 'paid_break', 'unpaid_break']:
-                raise ValueError(f"jobcode_type must be one of: regular, pto, paid_break, unpaid_break")
+                raise ClientSafeError(f"jobcode_type must be one of: regular, pto, paid_break, unpaid_break")
             clean_params['jobcode_type'] = jobcode_type
         
         # Handle boolean parameters
@@ -1651,7 +1662,7 @@ class ReportsAPI(BaseAPI):
         # Handle custom fields: ensure values are lists
         if 'customfielditems' in data_payload:
             if not isinstance(data_payload['customfielditems'], dict):
-                raise ValueError("customfielditems must be a dictionary")
+                raise ClientSafeError("customfielditems must be a dictionary")
             for field_id, values in data_payload['customfielditems'].items():
                 if not isinstance(values, list):
                     data_payload['customfielditems'][field_id] = [values]
@@ -1659,11 +1670,11 @@ class ReportsAPI(BaseAPI):
         # Ensure dates are in YYYY-MM-DD format
         for date_field in ['start_date', 'end_date']:
             if date_field not in data_payload:
-                raise ValueError(f"Missing required field: {date_field}")
+                raise ClientSafeError(f"Missing required field: {date_field}")
             try:
                 datetime.strptime(data_payload[date_field], '%Y-%m-%d')
             except ValueError:
-                raise ValueError(f"Invalid date format for {date_field}. Expected YYYY-MM-DD")
+                raise ClientSafeError(f"Invalid date format for {date_field}. Expected YYYY-MM-DD") from None
         
         # Make POST request with data_payload wrapped in a 'data' key
         return self.make_request('reports/project', method='POST', data={'data': data_payload})
@@ -1741,21 +1752,7 @@ class QuickBooksTimeAPI(BaseAPI):
             self.upstream.remember('validated', 90)
             return True
         except requests.exceptions.RequestException as error:
-            if error.response is not None:
-                error_message = ""
-                try:
-                    error_message = error.response.json().get('error', {}).get('message') or error.response.reason
-                except requests.exceptions.JSONDecodeError:
-                    error_message = error.response.reason
-                status = error.response.status_code
-                log_error(f'upstream failure stage=startup status={status}')
-                if status == 429:
-                    self.upstream.remember('throttled', retry_seconds(error.response.headers.get('Retry-After')))
-                raise ValueError(f'Token validation failed: {status} - {error_message}')
-            elif error.request is not None:
-                raise ValueError('Token validation failed: No response received from server')
-            else:
-                raise ValueError(f'Token validation failed: {str(error)}')
+            return self.handle_axios_error(error, 'startup')
 
     def get_jobcodes(self, params: Optional[Dict[str, Any]] = None):
         return self.jobcode_api.get_jobcodes(params)

@@ -38,8 +38,23 @@ Copy `deploy/windows/qbtime.example.json` to a private path and replace every
 account/path with actual values. The JSON must not contain credentials. Use a
 stable release directory, a private existing environment file, the reviewed
 gateway entry point/version and a writable private state directory. Restrict
-the environment file and state directory to the operating account and
-administrators with the normal deployment ACLs.
+the environment file, gateway key file and state directory to the service
+account and administrators with the normal deployment ACLs.
+
+Set `gatewayKeyFile` to the absolute path of a private UTF-8 text file without
+a BOM. Store one randomly generated, high-entropy printable ASCII token per
+line. This token authenticates a caller to the gateway. The upstream
+`QB_TIME_ACCESS_TOKEN` belongs only to the stdio application. Keep both
+tokens outside Git, logs and command arguments.
+
+The supervised gateway listens on `127.0.0.1`. Configure each SSE client to
+send `Authorization: Bearer <gateway token>` on both the SSE connection and
+message requests. Store the token in the client's credential manager. For an
+upgrade, enroll callers before restarting the supervisor and verify reachability
+from their actual runtime. For rotation, place the new and previous keys on
+separate lines, restart the gateway, migrate callers, then remove the old key
+and restart. The readiness probe uses the first key. The lightweight
+`/healthz` endpoint is available on loopback without a credential.
 
 First run `python deploy/windows/supervisor.py --config C:\private\qbtime.json
 --check`. This verifies paths, required release files and the gateway version;
@@ -79,8 +94,7 @@ never starts the task. Activation is a separate `Start-ScheduledTask` action.
 
 The task uses the environment's `pythonw.exe` to avoid a visible console. The
 supervisor launches its child using the configured `python.exe` so stdio remains
-available. Existing interface binding is preserved; any restriction to loopback
-must first be tested from every caller, including Docker.
+available.
 
 ## Logs, validation and rollback
 

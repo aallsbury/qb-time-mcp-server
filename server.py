@@ -5,7 +5,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 import mcp.types as types
 from api import QuickBooksTimeAPI
-from utils import setup_logging, log_info, log_error
+from utils import ClientSafeError, setup_logging, log_info, log_error
 
 JSONRPC_VERSION = "2.0"
 PROTOCOL_VERSION = "2024-11-05"
@@ -613,7 +613,7 @@ class JSONRPCServer:
         }
 
         if name not in method_map:
-            self.send_error_response(message['id'], -32601, f'Unknown method: {name}')
+            self.send_error_response(message['id'], -32601, 'Unknown tool. Use tools/list to see available tools.')
             return
 
         try:
@@ -628,9 +628,12 @@ class JSONRPCServer:
                     }]
                 }
             })
-        except Exception as e:
-            log_error(f'Tool failure stage=tool tool={name} category={type(e).__name__}')
-            self.send_error_response(message['id'], -32000, str(e))
+        except ClientSafeError as error:
+            log_error(f'Tool failure stage=tool tool={name} category=ClientSafeError')
+            self.send_error_response(message['id'], -32000, str(error))
+        except Exception:
+            log_error(f'Tool failure stage=tool tool={name} category=UnexpectedError')
+            self.send_error_response(message['id'], -32000, 'QuickBooks Time tool failed. Check the tool arguments and service logs.')
 
     def handle_message(self, message_str: str):
         message_id = self.get_next_id()
@@ -662,7 +665,7 @@ class JSONRPCServer:
                 if 'id' in message:
                     self.send_error_response(message['id'], -32601, 'Method not found')
                 else:
-                    log_info(f'Received notification for method: {message["method"]}')
+                    log_info('Ignored unhandled notification')
 
         except json.JSONDecodeError:
             self.send_error_response(message_id, -32700, 'Parse error')
@@ -678,7 +681,7 @@ class JSONRPCServer:
 
     def start(self):
         log_info('QuickBooks Time MCP Server Starting')
-        log_info(f'Environment: {{"tokenConfigured": {bool(self.api.access_token)}, "nodeEnv": "{self.node_env}"}}')
+        log_info(f'Token configured: {bool(self.api.access_token)}')
 
         # Send initial server info
         self.send_server_info()

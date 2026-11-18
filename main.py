@@ -18,11 +18,11 @@ def main(argv=None):
     parser.add_argument("--env-file", type=Path, default=Path(__file__).with_name(".env"))
     parser.add_argument("--check-config", action="store_true", help="Validate configuration/imports without API calls or a listener")
     args = parser.parse_args(argv)
-    # Existing process environment wins; .env lookup no longer depends on cwd.
-    load_dotenv(dotenv_path=args.env_file, override=False)
-    token = os.getenv("QB_TIME_ACCESS_TOKEN", "").strip()
-    setup_logging(secret=token)
     try:
+        # Existing process environment wins; .env lookup no longer depends on cwd.
+        load_dotenv(dotenv_path=args.env_file, override=False)
+        token = os.getenv("QB_TIME_ACCESS_TOKEN", "").strip()
+        setup_logging(secret=token)
         if not token:
             raise ValueError("QB_TIME_ACCESS_TOKEN environment variable is required")
         timeout = request_timeout()
@@ -32,7 +32,7 @@ def main(argv=None):
             return 0
         run_server(token, os.getenv("NODE_ENV", "development"))
         return 0
-    except (ValueError, ImportError) as exc:
+    except Exception as exc:
         # Do not echo credentials or provider response bodies to boot-task output.
         logging.error('QBTime startup failed category=%s', type(exc).__name__)
         print(f"QBTime startup failed ({type(exc).__name__}); check configuration and protected service logs.", file=sys.stderr)

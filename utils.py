@@ -2,6 +2,10 @@ import logging
 from logging.handlers import RotatingFileHandler
 import os
 
+class ClientSafeError(ValueError):
+    """An actionable error containing only reviewed, public diagnostic text."""
+
+
 class _SecretFilter(logging.Filter):
     def __init__(self, secret):
         super().__init__()

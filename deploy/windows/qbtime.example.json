@@ -6,6 +6,7 @@
   "gateway": "C:\\Services\\QBTime\\gateway\\node_modules\\supergateway\\dist\\index.js",
   "gatewayVersion": "4.2.1",
   "envFile": "C:\\Services\\QBTime\\private\\qbtime.env",
+  "gatewayKeyFile": "C:\\Services\\QBTime\\private\\gateway.keys",
   "stateDirectory": "C:\\Services\\QBTime\\state",
   "port": 9994,
   "startupTimeoutSeconds": 60,

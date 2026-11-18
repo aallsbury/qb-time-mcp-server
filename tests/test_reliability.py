@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import secrets
 import socket
 import shutil
 import subprocess
@@ -25,7 +26,7 @@ import config
 import main
 import server
 from supervisor import InstanceLock, ProcessTree, capture_errors, gateway_command
-from probe import probe
+from probe import gateway_probe_key, probe
 
 CONTRACT = json.loads((ROOT / 'tests/fixtures/deployed-tool-contract.json').read_text())
 
@@ -162,10 +163,21 @@ class HttpTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == 'nt', 'Windows ownership tests')
 class OwnershipTests(unittest.TestCase):
+    def test_gateway_probe_uses_first_nonempty_key_and_rejects_empty_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            keys = Path(directory) / 'gateway.keys'
+            keys.write_text('\nfirst\nsecond\n', encoding='utf-8')
+            self.assertEqual(gateway_probe_key(keys), 'first')
+            keys.write_text(' \n', encoding='utf-8')
+            with self.assertRaises(ValueError):
+                gateway_probe_key(keys)
+
     def test_child_logs_reduce_payloads_to_metadata(self):
         logger = unittest.mock.Mock()
         capture_errors(io.BytesIO(b'category=ValueError status=401 synthetic-secret employee-payload\n'), logger)
         self.assertEqual(logger.error.call_args.args, ('gateway stderr category=%s status=%s', 'ValueError', '401'))
+        capture_errors(io.BytesIO(b'category=SensitiveText status=403\n'), logger)
+        self.assertEqual(logger.error.call_args.args, ('gateway stderr category=%s status=%s', 'child-diagnostic', '403'))
     def test_info_and_blank_stderr_are_not_reported_as_errors(self):
         logger = unittest.mock.Mock()
         capture_errors(io.BytesIO(b'\r\n[supergateway] Child stderr: 2026-01-01 - INFO - synthetic-secret\n\n'), logger)
@@ -221,6 +233,9 @@ class OwnershipTests(unittest.TestCase):
             (root / 'main.py').write_text(source)
             (root / 'config.py').write_text('# Synthetic release marker\n')
             (root / 'synthetic.env').write_text('QB_TIME_ACCESS_TOKEN=synthetic-token\n')
+            gateway_key = secrets.token_urlsafe(32)
+            key_file = root / 'gateway.keys'
+            key_file.write_text(gateway_key + '\n', encoding='utf-8')
             gateway = Path(gateway_root) / 'node_modules/supergateway/dist/index.js'
             with socket.socket() as reservation:
                 reservation.bind(('127.0.0.1', 0))
@@ -228,7 +243,8 @@ class OwnershipTests(unittest.TestCase):
             config = {'account': subprocess.check_output(['whoami'], text=True).strip(),
                       'repoRoot': str(root), 'python': sys.executable, 'node': shutil.which('node'),
                       'gateway': str(gateway), 'gatewayVersion': '4.2.1', 'envFile': str(root / 'synthetic.env'),
-                      'stateDirectory': str(root / 'state'), 'port': port, 'startupTimeoutSeconds': 10,
+                      'gatewayKeyFile': str(key_file), 'stateDirectory': str(root / 'state'),
+                      'port': port, 'startupTimeoutSeconds': 10,
                       'probeIntervalSeconds': 300, 'maxConsecutiveFailures': 1, 'cooldownSeconds': 1,
                       'stableResetSeconds': 60, 'restartDelaysSeconds': [1]}
             config_path = root / 'config.json'
@@ -260,6 +276,15 @@ class OwnershipTests(unittest.TestCase):
             handle = None
             try:
                 first = ready()
+                base = f'http://127.0.0.1:{port}'
+                self.assertNotIn(gateway_key, ' '.join(gateway_command(config)))
+                self.assertEqual(gateway_command(config)[gateway_command(config).index('--host') + 1], '127.0.0.1')
+                with requests.get(base + '/healthz', timeout=2) as response:
+                    self.assertEqual(response.status_code, 200)
+                for method, path in [('GET', '/sse'), ('POST', '/message')]:
+                    with requests.request(method, base + path, timeout=2, stream=True) as response:
+                        self.assertEqual(response.status_code, 401)
+                self.assertEqual(probe(port, key_file=key_file)['toolCount'], len(CONTRACT['tools']))
                 handle = kernel.OpenProcess(0x0001 | 0x00100000, False, first)
                 self.assertTrue(handle)
                 self.assertTrue(kernel.TerminateProcess(handle, 71))
@@ -290,7 +315,7 @@ class SseIntegrationTests(unittest.TestCase):
             reservation.bind(('127.0.0.1', 0))
             cls.port = reservation.getsockname()[1]
         stdio = f'"{sys.executable}" "{ROOT / "tests/fake_stdio.py"}"'
-        command = ['node', str(gateway), '--port', str(cls.port), '--stdio', stdio, '--logLevel', 'none']
+        command = ['node', str(gateway), '--host', '127.0.0.1', '--port', str(cls.port), '--stdio', stdio, '--logLevel', 'none']
         cls.process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         cls.job = ProcessTree() if os.name == 'nt' else None
         cls.addClassCleanup(cls.cleanup_gateway)

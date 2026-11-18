@@ -8,6 +8,8 @@ import os
 import sqlite3
 import time
 
+from utils import ClientSafeError
+
 
 def retry_seconds(header):
     try:
@@ -56,4 +58,4 @@ class UpstreamState:
     def check_rate_limit(self):
         delay = self.remaining('throttled')
         if delay:
-            raise ValueError(f'QuickBooks Time rate limited (429). Retry after {delay} seconds.')
+            raise ClientSafeError(f'QuickBooks Time rate limited (429). Retry after {delay} seconds.')

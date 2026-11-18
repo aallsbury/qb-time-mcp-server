@@ -15,20 +15,21 @@ import sys
 import time
 import threading
 
-from probe import probe
+from probe import gateway_probe_key, probe
 
 
 def load_config(path):
     config = json.loads(Path(path).read_text(encoding='utf-8-sig'))
-    for key in ('repoRoot', 'python', 'node', 'gateway', 'envFile', 'stateDirectory'):
+    for key in ('repoRoot', 'python', 'node', 'gateway', 'envFile', 'gatewayKeyFile', 'stateDirectory'):
         value = config[key]
         if not isinstance(value, str) or not Path(value).is_absolute():
             raise ValueError(f'{key} must be an absolute path')
         if any(char in value for char in '\n\r"&|<>^%!'):
             raise ValueError(f'{key} contains shell control characters')
-    for key in ('python', 'node', 'gateway', 'envFile'):
+    for key in ('python', 'node', 'gateway', 'envFile', 'gatewayKeyFile'):
         if not Path(config[key]).is_file():
             raise ValueError(f'{key} does not exist')
+    gateway_probe_key(config['gatewayKeyFile'])
     for name in ('main.py', 'config.py', 'tests/fixtures/deployed-tool-contract.json'):
         if not (Path(config['repoRoot']) / name).is_file():
             raise ValueError(f'Release is incomplete: {name}')
@@ -56,7 +57,8 @@ def gateway_command(config):
     stdio = ' '.join('"' + value + '"' for value in (
         config['python'], str(Path(config['repoRoot']) / 'main.py'),
         '--env-file', config['envFile']))
-    return [config['node'], config['gateway'], '--port', str(config['port']),
+    return [config['node'], config['gateway'], '--host', '127.0.0.1', '--port', str(config['port']),
+            '--apiKeyFile', config['gatewayKeyFile'],
             '--stdio', stdio, '--ssePath', '/sse', '--messagePath', '/message',
             '--healthEndpoint', '/healthz', '--logLevel', 'info']
 
@@ -148,19 +150,20 @@ def capture_errors(pipe, logger, tool_names=()):
                 logger.info('application informational message')
                 continue
             category = re.search(r'category=([A-Za-z]+)', text)
+            safe_category = category.group(1) if category and category.group(1) in (
+                'ValueError', 'TypeError', 'TimeoutError', 'HTTPError', 'ConnectionError') else None
             status = re.search(r'status=([0-9]{3})', text)
             stage = re.search(r'\bstage=(startup|tool)\b', text)
             tool = re.search(r'\btool=(get_[a-z_]+)\b', text)
             if stage:
                 logger.error('gateway stage=%s tool=%s category=%s status=%s',
                              stage.group(1), tool.group(1) if tool and tool.group(1) in tool_names else '-',
-                             category.group(1) if category and category.group(1) in
-                             ('ValueError', 'TypeError', 'TimeoutError', 'HTTPError', 'ConnectionError') else 'upstream',
+                             safe_category or 'upstream',
                              status.group(1) if status else '-')
                 continue
             if category or status or ' - ERROR - ' in text or 'Traceback (' in text:
                 logger.error('gateway stderr category=%s status=%s',
-                             category.group(1) if category else 'child-diagnostic',
+                             safe_category or 'child-diagnostic',
                              status.group(1) if status else 'unknown')
             else:
                 logger.warning('unclassified gateway diagnostic; payload omitted')
@@ -194,6 +197,9 @@ def supervise(config, config_path):
             ready = False
             try:
                 environment = os.environ.copy()
+                # Only the keys in the deployment's ACL-protected file grant access.
+                environment.pop('SUPERGATEWAY_API_KEY', None)
+                environment.pop('SUPERGATEWAY_API_KEY_FILE', None)
                 # The gateway starts one stdio process per session. Aggregate
                 # metadata in this process, avoiding multiprocess file rotation.
                 environment.pop('QBT_LOG_FILE', None)
@@ -215,7 +221,7 @@ def supervise(config, config_path):
                 bad_probes = 0
                 while child.poll() is None:
                     try:
-                        result = probe(config['port'], names)
+                        result = probe(config['port'], names, key_file=config['gatewayKeyFile'])
                         ready = True
                         bad_probes = 0
                         write_status(state, state='ready', launcherPid=child.pid, **result)
