@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/aallsbury-qb-time-mcp-server-badge.png)](https://mseep.ai/app/aallsbury-qb-time-mcp-server)
+
 # QuickBooks Time MCP Server (V2 Update)
 
 For reproducible dependencies, bounded API requests, compatibility tests and
